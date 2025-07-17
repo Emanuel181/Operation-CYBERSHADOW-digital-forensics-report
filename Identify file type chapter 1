@@ -1,0 +1,366 @@
+import os
+import argparse
+import zipfile
+import tarfile
+import tempfile
+import shutil
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+try:
+    import py7zr
+
+    HAS_PY7ZR = True
+except ImportError:
+    HAS_PY7ZR = False
+    logging.warning("py7zr library not found. .7z archives will be identified but NOT extracted.")
+
+
+def is_text_file(filepath: str, bytes_to_check: int = 512,
+                 min_printable_ratio: float = 0.9, max_null_bytes: int = 0) -> bool:
+    try:
+        with open(filepath, 'rb') as f:
+            data = f.read(bytes_to_check)
+        if not data:
+            return False
+
+        try:
+            data.decode('utf-8')
+            return True
+        except UnicodeDecodeError:
+            pass
+
+        printable_chars = 0
+        null_bytes = 0
+        for byte_val in data:
+            if 32 <= byte_val <= 127 or byte_val in (9, 10, 13):
+                printable_chars += 1
+            if byte_val == 0:
+                null_bytes += 1
+
+        if null_bytes > max_null_bytes:
+            return False
+
+        if len(data) > 0 and (printable_chars / len(data)) < min_printable_ratio:
+            return False
+
+        return True
+    except (IOError, OSError) as e:
+        logging.debug(f"Could not read file {filepath} for text check: {e}")
+        return False
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during text file check for {filepath}: {e}")
+        return False
+
+
+def identify_file_type(file_path: str) -> str:
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(64)
+
+            if header.startswith(b'RTBTCore'):
+                return "Unknown proprietary format (RTBTCore)"
+            if header.startswith(b'sdPC'):
+                return "Unknown proprietary format (sdPC)"
+
+            if header.startswith(b'\xFF\xD8\xFF'):
+                return 'JPEG image'
+            if header.startswith(b'\x89PNG\r\n\x1a\n'):
+                return 'PNG image'
+            if header.startswith(b'GIF87a') or header.startswith(b'GIF89a'):
+                return 'GIF image'
+            if header.startswith(b'\x42\x4D'):
+                return 'BMP image'
+            if header.startswith(b'RIFF') and len(header) >= 12 and header[8:12] == b'WEBP':
+                return 'WEBP image'
+
+            if header.startswith(b'%PDF'):
+                return 'PDF document'
+            if header.startswith(b'\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1'):
+                return 'MS Office legacy file (DOC, PPT, XLS)'
+            if header.startswith(b'\x25\x21\x50\x53'):
+                return 'PostScript document'
+
+            if header.startswith(b'\x50\x4B\x03\x04'):
+                return 'ZIP archive / Office OpenXML (DOCX, PPTX, XLSX) / JAR'
+            if header.startswith(b'\x37\x7A\xBC\xAF\x27\x1C'):
+                return '7Z archive'
+            if header.startswith(b'Rar!\x1A\x07\x00') or header.startswith(b'Rar!\x1A\x07\x01\x00'):
+                return 'RAR archive'
+            if header.startswith(b'\x1F\x8B'):
+                return 'GZIP archive'
+            if header.startswith(b'BZh'):
+                return 'BZIP2 archive'
+            f.seek(0)
+            full_header_for_tar = f.read(512)
+            if len(full_header_for_tar) >= 263 and full_header_for_tar[257:262] == b'ustar':
+                return 'TAR archive'
+
+            if header.startswith(b'RIFF') and len(header) >= 12 and header[8:12] == b'AVI ':
+                return 'AVI video'
+            if header.startswith(b'RIFF') and len(header) >= 12 and header[8:12] == b'WAVE':
+                return 'WAV audio'
+            if header.startswith(b'ID3') or (len(header) >= 2 and header[0] == 0xFF and (header[1] & 0xE0) == 0xE0):
+                return 'MP3 audio'
+            if header.startswith(b'fLaC'):
+                return 'FLAC audio'
+            if header.startswith(b'OggS'):
+                return 'OGG audio'
+            if len(header) >= 12 and header[4:8] == b'ftyp':
+                major_brand = header[8:12]
+                if major_brand in [b'isom', b'iso2', b'mp41', b'mp42', b'mp4f', b'M4A ', b'M4V ']:
+                    return 'MP4 video/audio'
+                elif major_brand == b'qt  ':
+                    return 'MOV video'
+                else:
+                    return f'MP4/MOV (ftyp: {major_brand.decode(errors="ignore")})'
+            if header.startswith(b'\x30\x26\xB2\x75\x8E\x66\xCF\x11\xA6\xD9\x00\xAA\x00\x62\xCE\x6C'):
+                return 'ASF video/audio (WMV, WMA)'
+            if header.startswith(b'.RMF'):
+                return 'RealMedia video/audio'
+            if header.startswith(b'FLV\x01'):
+                return 'Flash Video (FLV)'
+            if header.startswith(b'\x1A\x45\xDF\xA3'):
+                return 'Matroska Video (MKV/WebM)'
+
+            if header.startswith(b'MZ'):
+                return 'Windows Executable (EXE/DLL) [MZ header]'
+            if header.startswith(b'\x7FELF'):
+                return 'ELF Executable'
+            if header.startswith(b'\xFE\xED\xFA\xCE') or \
+                    header.startswith(b'\xCE\xFA\xED\xFE') or \
+                    header.startswith(b'\xFE\xED\xFA\xCF') or \
+                    header.startswith(b'\xCF\xFA\xED\xFE'):
+                return 'Mach-O Executable (macOS/iOS)'
+
+            if header.startswith(b'SQLite format 3\x00'):
+                return 'SQLite Database'
+            if header.startswith(b'\x4C\x00\x00\x00\x01\x14\x02\x00'):
+                return 'Windows Shortcut (LNK)'
+            if header.startswith(b'\xCA\xFE\xBA\xBE'):
+                return 'Java Class File'
+            if header.startswith(b'CWS') or header.startswith(b'FWS'):
+                return 'Shockwave Flash (SWF)'
+
+            if header.strip().startswith(b'<?xml') or \
+                    header.strip().lower().startswith(b'<!doctype html') or \
+                    header.strip().lower().startswith(b'<html') or \
+                    header.strip().lower().startswith(b'<svg'):
+                if is_text_file(file_path):
+                    if header.strip().lower().startswith(b'<!doctype html') or \
+                            header.strip().lower().startswith(b'<html'):
+                        return 'HTML document'
+                    if header.strip().lower().startswith(b'<svg'):
+                        return 'SVG image'
+                    return 'XML file'
+            if (header.strip().startswith(b'{') or header.strip().startswith(b'[')) and is_text_file(file_path):
+                return 'JSON or structured text'
+            if b',' in header[:64] and is_text_file(file_path):
+                return 'CSV or delimited text'
+            if header.strip().startswith(b';') and is_text_file(file_path):
+                return 'INI config file'
+            if header.startswith(b'#!') and is_text_file(file_path):
+                f.seek(0)
+                first_line = f.readline().strip()
+                if b'python' in first_line.lower():
+                    return 'Python script'
+                elif b'bash' in first_line.lower() or b'sh' in first_line.lower():
+                    return 'Shell script'
+                elif b'perl' in first_line.lower():
+                    return 'Perl script'
+                elif b'php' in first_line.lower():
+                    return 'PHP script'
+                elif b'ruby' in first_line.lower():
+                    return 'Ruby script'
+                return 'Executable script (Shebang)'
+
+            if is_text_file(file_path):
+                return "Plain text file"
+
+            return "Unknown/unsupported format"
+    except (IOError, OSError) as e:
+        return f"Error reading file: {e}"
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during file type identification for {file_path}: {e}")
+        return f"Error during identification: {e}"
+
+
+ARCHIVE_EXTENSIONS = ['.zip', '.jar', '.tar', '.gz', '.bz2', '.7z',
+                      '.rar']
+
+
+def is_archive(file_path: str) -> bool:
+    ext = os.path.splitext(file_path)[1].lower()
+    return ext in ARCHIVE_EXTENSIONS
+
+
+def extract_archive(file_path: str, temp_dir: str) -> str | None:
+    extract_path = None
+    try:
+        extract_path = tempfile.mkdtemp(dir=temp_dir)
+
+        if zipfile.is_zipfile(file_path):
+            with zipfile.ZipFile(file_path, 'r') as zf:
+                zf.extractall(extract_path)
+            logging.info(f"Extracted ZIP archive: {file_path} to {extract_path}")
+        elif file_path.endswith(('.tar', '.gz', '.tgz')):
+            with tarfile.open(file_path, 'r:*') as tf:
+                tf.extractall(extract_path)
+            logging.info(f"Extracted TAR/GZ archive: {file_path} to {extract_path}")
+        elif file_path.endswith('.7z'):
+            if HAS_PY7ZR:
+                with py7zr.SevenZipFile(file_path, mode='r') as sz:
+                    sz.extractall(path=extract_path)
+                logging.info(f"Extracted 7Z archive: {file_path} to {extract_path}")
+            else:
+                logging.warning(f"Skipping .7z extraction for {file_path}: py7zr library not installed.")
+                return None
+        elif file_path.endswith('.bz2'):
+            try:
+                with tarfile.open(file_path, 'r:bz2') as tf:
+                    tf.extractall(extract_path)
+                logging.info(f"Extracted TAR.BZ2 archive: {file_path} to {extract_path}")
+            except tarfile.ReadError:
+                import bz2
+                name_without_ext = os.path.splitext(os.path.basename(file_path))[0]
+                output_path = os.path.join(extract_path, name_without_ext)
+                with bz2.open(file_path, 'rb') as f_in, open(output_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+                logging.info(f"Decompressed BZ2 file: {file_path} to {output_path}")
+        elif file_path.endswith('.rar'):
+            logging.warning(
+                f"RAR extraction for {file_path} is not supported by default Python libraries. Requires external tools like 'unrar'.")
+            return None
+        else:
+            logging.debug(f"Unsupported archive type for extraction based on extension: {file_path}")
+            return None
+        return extract_path
+    except (zipfile.BadZipFile, tarfile.ReadError, py7zr.Bad7zFile, OSError, IOError) as e:
+        logging.error(f"Error extracting archive {file_path}: {e}")
+        if extract_path and os.path.exists(extract_path):
+            shutil.rmtree(extract_path)
+        return None
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during archive extraction for {file_path}: {e}")
+        if extract_path and os.path.exists(extract_path):
+            shutil.rmtree(extract_path)
+        return None
+
+
+def scan_directory(base_path: str, max_depth: int | None = None, current_depth: int = 0,
+                   initial_scan_root: str | None = None, results: list | None = None,
+                   parent_archive_rel_path: str | None = None,
+                   parent_temp_dir: str | None = None) -> list:
+    if results is None:
+        results = []
+    if initial_scan_root is None:
+        initial_scan_root = base_path
+
+    if max_depth is not None and current_depth >= max_depth:
+        return results
+
+    try:
+        for entry in os.scandir(base_path):
+            if entry.is_file():
+                file_type = identify_file_type(entry.path)
+
+                if parent_archive_rel_path:
+                    path_inside_extracted_archive = os.path.relpath(entry.path, base_path)
+                    display_path = f"{parent_archive_rel_path}::{path_inside_extracted_archive}"
+                else:
+                    display_path = os.path.normpath(os.path.relpath(entry.path, initial_scan_root))
+
+                results.append({
+                    'display_path': display_path,
+                    'actual_type': file_type,
+                    'full_system_path': entry.path
+                })
+
+                if is_archive(entry.path):
+                    current_archive_rel_path_for_child = display_path
+
+                    with tempfile.TemporaryDirectory(dir=parent_temp_dir) as temp_sub_dir:
+                        extracted_path = extract_archive(entry.path, temp_sub_dir)
+                        if extracted_path:
+                            scan_directory(extracted_path, max_depth, current_depth + 1,
+                                           initial_scan_root, results,
+                                           parent_archive_rel_path=current_archive_rel_path_for_child,
+                                           parent_temp_dir=parent_temp_dir)
+                        else:
+                            logging.info(
+                                f"Could not extract {entry.name} from {os.path.dirname(entry.path)}. Might be corrupted or unsupported.")
+
+            elif entry.is_dir():
+                scan_directory(entry.path, max_depth, current_depth + 1,
+                               initial_scan_root, results,
+                               parent_archive_rel_path=parent_archive_rel_path,
+                               parent_temp_dir=parent_temp_dir)
+    except (IOError, OSError) as e:
+        logging.error(f"Error accessing directory {base_path}: {e}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during directory scan for {base_path}: {e}")
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Recursive file type detector (by magic number & content, with archive deep scan).")
+    parser.add_argument(
+        '--path',
+        type=str,
+        required=True,
+        help='Path to scan (file or directory). E.g., C:\\Evidence\\Case001 or /home/user/data'
+    )
+    parser.add_argument(
+        '--max_depth',
+        type=int,
+        default=None,
+        help='Optional: Maximum recursion depth for subfolders and nested archives. '
+             'Default is unlimited.'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        default="chapter1_filetype_results.txt",
+        help='Optional: Output file path to save results. Default is chapter1_filetype_results.txt.'
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.path):
+        logging.error(f"Error: The provided path '{args.path}' does not exist.")
+        return
+
+    with tempfile.TemporaryDirectory() as overall_temp_dir:
+        logging.info(f"Starting scan of '{args.path}'...")
+        results = scan_directory(args.path, args.max_depth, initial_scan_root=args.path,
+                                 parent_temp_dir=overall_temp_dir)
+        logging.info(f"Scan complete. Writing results to '{args.output}'...")
+
+        try:
+            with open(args.output, "w", encoding="utf-8") as f:
+                results.sort(key=lambda x: x['display_path'].lower())
+
+                max_path_len = max(len(r['display_path']) for r in results) if results else 20
+                max_type_len = max(len(r['actual_type']) for r in results) if results else 30
+
+                max_path_len = max(max_path_len, len("File Path (Relative)"))
+                max_type_len = max(max_type_len, len("Identified Type"))
+
+                header_line = f"{'File Path (Relative)':<{max_path_len}} | {'Identified Type':<{max_type_len}}\n"
+                f.write(header_line)
+                f.write("-" * len(header_line) + "\n")
+
+                for item in results:
+                    f.write(f"{item['display_path']:<{max_path_len}} | {item['actual_type']:<{max_type_len}}\n")
+
+            logging.info(f"\nDone! Results saved to {args.output}")
+        except IOError as e:
+            logging.error(f"Failed to write results to output file '{args.output}': {e}")
+        except Exception as e:
+            logging.error(f"An unexpected error occurred while writing results: {e}")
+
+
+if __name__ == "__main__":
+    main()
